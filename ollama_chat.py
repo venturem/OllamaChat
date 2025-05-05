@@ -1,8 +1,12 @@
-from nicegui import ui
+
+from nicegui import ui, run
+from time import sleep
 import requests
 import sqlite3
+import re
 from datetime import datetime
-import asyncio
+
+
 
 # === SQLite Setup ===
 DB_PATH = 'chat_history.db'
@@ -32,8 +36,20 @@ def load_history():
     c = conn.cursor()
     c.execute('SELECT role, content FROM messages ORDER BY id ASC')
     messages = c.fetchall()
+    print(f"Loaded : {messages}")
     conn.close()
     return messages
+
+def chat_with_ollama(model, message, history):
+    payload = {
+        'model': model,
+        'messages': history + [{'role': 'user', 'content': message}],
+        'stream': False
+    }
+    response = requests.post(f'{OLLAMA_URL}/api/chat', json=payload)
+    response.raise_for_status()
+    data = response.json()
+    return data.get('message', {}).get('content', '[No response]')
 
 # === Ollama API Interaction ===
 OLLAMA_URL = 'http://localhost:11434'
@@ -48,73 +64,105 @@ def get_available_models():
         print('Failed to get models:', e)
         return []
 
-def chat_with_ollama(model, message, history):
-    payload = {
-        'model': model,
-        'messages': history + [{'role': 'user', 'content': message}],
-        'stream': False
-    }
-    response = requests.post(f'{OLLAMA_URL}/api/chat', json=payload)
-    response.raise_for_status()
-    data = response.json()
-    return data.get('message', {}).get('content', '[No response]')
+models_list = get_available_models()
+print(f" Models Count : {len(models_list)}")
+selected_model = models_list[0]
+selected_model='qwen3:0.6b'
+
+message_stack=[{'role': 'user', 'content': 'input_text'}]
+chat_messages= None
 
 # === UI Setup ===
 init_db()
-chat_history_ui = ui.column().classes('w-full max-w-2xl mx-auto p-4')
 
-# Get models and set default
-model_list = get_available_models()
-if not model_list:
-    raise RuntimeError("❌ No models found in Ollama. Run `ollama pull <model>` first.")
-selected_model = {'name': model_list[0]}
 
-# Model dropdown
-with ui.row().classes('justify-center p-2'):
-    ui.label('Choose model:')
-    ui.select(model_list, value=selected_model['name'],
-              on_change=lambda e: selected_model.update({'name': e.value})
-              ).classes('w-48')
 
-# Display past history
-message_stack = []
-for role, content in load_history():
-    with chat_history_ui:
-        if role == 'user':
-            ui.html(f'<b>User:</b> {content}').classes('bg-gray-100 p-3 rounded shadow mb-2 w-full')
-        else:
-            ui.html(f'<b>Assistant:</b> {content}').classes('bg-blue-100 p-3 rounded shadow mb-2 w-full')
-    message_stack.append({'role': role, 'content': content})
+async def process_message(model_name, chat_input):
+    global messages, chat_messages, row1, chat_column, message_stack
+    input_text = chat_input.value
+    if (len(input_text) == 0) : return
+    print(f"Input is {input_text}")
+    # # messages.append(input_text)
+    message_stack.append({'role': 'user', 'content': input_text})
+    # # save_message('user',input_text)
 
-# Input & Button
-user_input = ui.input(placeholder='Type your message...').classes('w-full')
-ui.button('Send', on_click=lambda: send_message()).classes('mt-2')
+    with chat_column:
+        ui.chat_message(input_text, sent=False, avatar="https://robohash.org/human")
+        placeholder_chat = ui.chat_message("Thinking ...", sent=True, avatar="https://robohash.org/chatbot").classes('animate-pulse text-gray-500 italic')
 
-# Async message sending
-async def send_message():
-    msg = user_input.value.strip()
-    if not msg:
-        return
-    model = selected_model['name']
+    # chat_column.update()
+    # # response = await asyncio.to_thread(chat_with_ollama, model, msg, message_stack)
+    payload = {
+        'model': model_name,
+        'messages': message_stack + [{'role': 'user', 'content': input_text}],
+        'stream': False
+    }
 
-    with chat_history_ui:
-        ui.html(f'<b>User:</b> {msg}').classes('bg-gray-100 p-3 rounded shadow mb-2 w-full')
-    save_message('user', msg)
-    message_stack.append({'role': 'user', 'content': msg})
-    user_input.value = ''
+    output_text = await get_model_response(payload)
+    # output_text = 'Response' + input_text
+    # message_stack.append({'role': 'assistant', 'content': output_text})
 
-    spinner = ui.spinner(size='lg').classes('mt-4')
-    try:
-        response = await ui.run_io(lambda: chat_with_ollama(model, msg, message_stack))
-        with chat_history_ui:
-            ui.html(f'<b>Assistant ({model}):</b> {response}').classes('bg-blue-100 p-3 rounded shadow mb-2 w-full')
-        save_message('assistant', response)
-        message_stack.append({'role': 'assistant', 'content': response})
-    except Exception as e:
-        with chat_history_ui:
-            ui.html(f'<b>Error:</b> {str(e)}').classes('bg-red-100 p-3 rounded shadow mb-2 w-full')
-    finally:
-        spinner.visible = False
+    print(f"::: Response is {output_text}")
+    chat_column.remove(placeholder_chat)
+    with chat_column:
+        ui.chat_message(output_text, sent=True, avatar="https://robohash.org/chatbot")
+    # chat_column.update()
+    # # save_message('assistant',output_text)
 
-# Start the app
-ui.run(title='Ollama Chat')
+    print(f"Messages : {message_stack}") 
+
+async def get_model_response(payload):
+    URL=f'{OLLAMA_URL}/api/chat'
+    # response = requests.post(URL, json=payload)
+    response = await run.io_bound(requests.post, URL, json=payload, timeout=30)
+    response.raise_for_status()
+    data = response.json()
+    output_text = data.get('message', {}).get('content', '[No response]')
+    # Think tags to be removed
+    think_contents = re.findall(r'<think>(.*?)</think>', output_text, flags=re.DOTALL)
+    print(f"AI was thinking : {think_contents}" )
+    # Remove all think sections from text
+    cleaned_text = re.sub(r'<think>.*?</think>', '', output_text, flags=re.DOTALL)
+    return cleaned_text   
+
+def set_model(value):
+    global selected_model
+    selected_model = value.value
+    print(f'Selected: {selected_model}')
+
+# === Header ===
+with ui.header().classes('bg-blue-600 text-white'):
+    ui.button(icon='menu', on_click=lambda: left_drawer.toggle()).props('flat color=white')
+    ui.label('Local Ollama Chat').classes('text-xl font-bold ml-4')
+
+# === Blank Left Drawer ===
+left_drawer = ui.left_drawer(value=100).classes(' w-full bg-amber-500 border ')
+with left_drawer:
+    with ui.card(align_items='end').classes('w-full'):
+        ui.button("Hello", on_click=lambda: ui.notify('Hi!', position='center', close_button='OK')).classes('w-full')
+
+# === Footer ===
+with ui.footer().style('position: static').classes('bg-blue-600 text-white text-center'):
+    ui.label('© 2025 Local Ollama Chat')
+
+chat_area = None
+labels=[]
+
+# === Main Layout ===
+with ui.column().classes('bg-blue-200 w-full h-screen p-0 m-0 flex-auto'):
+
+    row1 = ui.row().classes('basis-1/5 bg-green-200 w-full p-10')
+    with row1:
+        chat_column = ui.column().classes('w-full')
+
+    row2 = ui.row(align_items=['stretch','end']).classes('flex-grow bg-amber-400 w-full p-2.5 ')
+    with row2:
+        chat_input = ui.textarea(label='Ask Query', placeholder='Type your question here', value="Hello AI").classes('w-full bg-blue-100 p-2.5 border-blue-600 border-2 ')
+        with ui.button_group().classes('w-full'):
+            ui.button('Chat', on_click=lambda: process_message(selected_model, chat_input)).classes('bg-blue-500 ml-2 w-1/3 max-h-20 ')
+            select1 = ui.select(models_list, value=selected_model, on_change=lambda e: set_model(e)  ).classes('ml-10 bg-green-500 w-1/2 max-h-20')
+
+# === Run App ===
+ui.run(title='NiceGUI Chat Layout')
+# left_drawer.toggle()
+# left_drawer.toggle()
